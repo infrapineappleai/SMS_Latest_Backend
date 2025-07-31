@@ -1,4 +1,4 @@
-const { User, StudentDetails, UserGrade, UserSlot, UserBranch, Branch, Slot, sequelize } = require('../../models/student_models/index');
+const { User, StudentDetails, UserGrade, UserSlot, UserBranch, Branch, Slot, Payment, sequelize } = require('../../models/student_models/index');
 
 exports.finalizeStudentRegistration = async (req, res) => {
   const transaction = await sequelize.transaction();
@@ -344,25 +344,39 @@ exports.deleteStudent = async (req, res) => {
   try {
     const userId = req.params.userId;
 
-    // Clean up related records
+    // Find student detail to get student_details.id
+    const studentDetail = await StudentDetails.findOne({
+      where: { user_id: userId },
+      transaction,
+    });
+
+    if (!studentDetail) throw new Error("Student not found");
+
+    const studentDetailsId = studentDetail.id;
+
+    // Delete related records
     await Promise.all([
-      StudentDetails.destroy({ where: { user_id: userId }, transaction }),
+      Payment.destroy({ where: { student_details_id: studentDetailsId }, transaction }),
       UserGrade.destroy({ where: { user_id: userId }, transaction }),
       UserSlot.destroy({ where: { user_id: userId }, transaction }),
-      UserBranch.destroy({ where: { user_id: userId }, transaction })
+      UserBranch.destroy({ where: { user_id: userId }, transaction }),
+      StudentDetails.destroy({ where: { user_id: userId }, transaction }),
     ]);
 
-    // Then delete the user
+    // Delete the user last
     const deleted = await User.destroy({ where: { id: userId }, transaction });
-    if (deleted === 0) throw new Error('Student user not found');
+    if (deleted === 0) throw new Error('User not found');
 
     await transaction.commit();
-    res.json({ success: true, message: 'Student deleted successfully' });
+    res.json({ success: true, message: 'Student and all related data deleted permanently' });
   } catch (error) {
     await transaction.rollback();
+    console.error("Hard delete failed:", error.message);
     res.status(400).json({ success: false, error: error.message });
   }
 };
+
+
 
 exports.getStudentBranches = async (req, res) => {
   try {

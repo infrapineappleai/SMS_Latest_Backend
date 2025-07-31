@@ -71,7 +71,7 @@ exports.searchStudents = async (req, res) => {
       const userBranch = user.user_branch && user.user_branch.length > 0 ? user.user_branch[0] : null;
       const branch = userBranch ? userBranch.branch : null;
       return {
-student_details_id: student.id || null,
+        student_details_id: student.id || null,
         student_no: student.student_no || null,
         photo_url: student.photo_url || null,
         branch_name: branch ? branch.branch_name : null,
@@ -148,7 +148,7 @@ exports.getAllStudents = async (req, res) => {
   }
 };
 
-const calculateCourseFees = async (studentDetailsId) => {
+const calculateCourseFees = async (studentDetailsId, selectedMonths = []) => {
   try {
     const student = await StudentDetails.findByPk(studentDetailsId, {
       include: [
@@ -200,18 +200,26 @@ const calculateCourseFees = async (studentDetailsId) => {
 
     let totalCourseFees = 0;
     const courseFees = {};
-    const currentMonth = format(new Date(), 'MMM'); // e.g., "Jul"
-    gradeFees.forEach(gf => {
-      const month = payments.length > 0 && payments[0].payment_date
-        ? format(new Date(payments[0].payment_date), 'MMM') // Extract short month from payment_date
-        : currentMonth;
-      if (!courseFees[month]) courseFees[month] = {};
-      if (!courseFees[month][`Grade ${gf.grade_id}`]) courseFees[month][`Grade ${gf.grade_id}`] = {};
-      if (!courseFees[month][`Grade ${gf.grade_id}`][gf.Grade.Course.name]) {
-        courseFees[month][`Grade ${gf.grade_id}`][gf.Grade.Course.name] = 0;
-      }
-      courseFees[month][`Grade ${gf.grade_id}`][gf.Grade.Course.name] += gf.fee;
-      totalCourseFees += gf.fee;
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    // If selectedMonths is provided, use it; otherwise, default to the current month
+    const targetMonths = selectedMonths.length > 0 ? selectedMonths : [format(new Date(), 'MMM')];
+
+    // Validate selectedMonths
+    const invalidMonths = targetMonths.filter(month => !months.includes(month));
+    if (invalidMonths.length > 0) {
+      throw new Error(`Invalid months: ${invalidMonths.join(', ')}`);
+    }
+
+    // Build courseFees for each selected month
+    targetMonths.forEach(month => {
+      courseFees[month] = {};
+      gradeFees.forEach(gf => {
+        const gradeName = `Grade ${gf.grade_id}`;
+        if (!courseFees[month][gradeName]) courseFees[month][gradeName] = {};
+        courseFees[month][gradeName][gf.Grade.Course.name] = gf.fee || 1000;
+        totalCourseFees += gf.fee || 1000;
+      });
     });
 
     const admissionFee = payments.length === 0 ? 1000 : 0;
@@ -233,20 +241,49 @@ const calculateCourseFees = async (studentDetailsId) => {
 exports.createPayment = async (req, res) => {
   try {
     const { student_details_id } = req.params;
-    const { payment_date } = req.body;
+    const { selectedMonths, course, full_name, student_no, status, branch_name } = req.body;
 
     if (!student_details_id || isNaN(student_details_id)) {
       return res.status(400).json({ error: "Valid student_details_id is required" });
     }
+    if (!selectedMonths || !Array.isArray(selectedMonths) || selectedMonths.length === 0) {
+      return res.status(400).json({ error: "Selected months are required and must be an array" });
+    }
 
-    const { courseFees, totalCourseFees, admissionFee, totalFees } = await calculateCourseFees(student_details_id);
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const invalidMonths = selectedMonths.filter(month => !months.includes(month));
+    if (invalidMonths.length > 0) {
+      return res.status(400).json({ error: `Invalid months selected: ${invalidMonths.join(', ')}` });
+    }
 
-    const payment = await Payment.create({
-      student_details_id,
-      payment_date: payment_date ? new Date(payment_date) : new Date(),
-      amount: totalFees,
-      status: 'Paid',
-    });
+    // Fetch course fees for the selected months
+    const { courseFees, totalCourseFees, admissionFee, totalFees } = await calculateCourseFees(student_details_id, selectedMonths);
+
+    if (!courseFees || Object.keys(courseFees).length === 0) {
+      return res.status(400).json({ error: "Failed to calculate course fees" });
+    }
+
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const payments = [];
+
+    // Create payment for each selected month
+    for (const month of selectedMonths) {
+      const monthIndex = months.indexOf(month);
+      const paymentDate = new Date(currentYear, monthIndex, 10);
+
+      const payment = await Payment.create({
+        student_details_id,
+        payment_date: paymentDate,
+        amount: totalFees / selectedMonths.length,
+        status: status || 'Paid',
+        course: course || 'Unknown',
+        full_name: full_name || 'Unknown Student',
+        student_no: student_no || `STU_${Date.now()}`,
+        branch_name: branch_name || 'N/A',
+      });
+      payments.push(payment);
+    }
 
     const student = await StudentDetails.findByPk(student_details_id, {
       include: [
@@ -278,27 +315,31 @@ exports.createPayment = async (req, res) => {
     }
 
     res.status(201).json({
-      message: "Payment created successfully",
-      paymentId: payment.id,
+      message: "Payments created successfully",
+      paymentIds: payments.map(p => p.id),
       student_details_id,
-      full_name: student.user ? `${student.user.first_name} ${student.user.last_name}` : 'Unknown Student',
-      branch_name: student.user.user_branch?.[0]?.branch?.branch_name || null,
+      full_name: student.user ? `${student.user.first_name} ${student.user.last_name}` : full_name || 'Unknown Student',
+      student_no: student.student_no || student_no || `STU_${Date.now()}`,
+      branch_name: student.user.user_branch?.[0]?.branch?.branch_name || branch_name || 'N/A',
+      course: course || 'Unknown',
       course_fees: courseFees,
       total_course_fees: totalCourseFees,
       admission_fee: admissionFee,
       total_fees: totalFees,
+      selectedMonths,
+      status: status || 'Paid',
+      date: new Date().toLocaleDateString('en-GB', { timeZone: 'Asia/Colombo' }),
     });
   } catch (error) {
-    console.error("Error creating payment:", error.message);
+    console.error("Error creating payments:", error.message);
     res.status(500).json({ error: "Internal server error", details: error.message });
   }
 };
 
-
-
 exports.calculateStudentFees = async (req, res) => {
   try {
     const { student_details_id } = req.params;
+    const { months } = req.query; // Add support for months query parameter
 
     if (!student_details_id || isNaN(student_details_id)) {
       return res.status(400).json({ error: "Valid student_details_id is required" });
@@ -335,28 +376,54 @@ exports.calculateStudentFees = async (req, res) => {
       order: [['payment_date', 'DESC']],
     });
 
-    // Determine the last paid month
-    let currentMonth = format(new Date(), 'MMM'); // e.g., "Jul"
-    if (payments.length > 0) {
-      const lastPaymentMonth = format(new Date(payments[0].payment_date), 'MMM'); // e.g., "Jul"
-      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-      const lastPaidIndex = months.indexOf(lastPaymentMonth);
-      const currentIndex = months.indexOf(currentMonth);
-      currentMonth = months[(lastPaidIndex + 1) % 12]; // Next month
+    const monthsList = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const queriedMonths = months ? months.split(',').filter(m => monthsList.includes(m)) : [];
+
+    let totalCourseFees = 0;
+    const courseFees = {};
+
+    if (queriedMonths.length > 0) {
+      queriedMonths.forEach(month => {
+        courseFees[month] = {};
+        gradeFees.forEach(gf => {
+          if (!courseFees[month][`Grade ${gf.grade_id}`]) {
+            courseFees[month][`Grade ${gf.grade_id}`] = {};
+          }
+          courseFees[month][`Grade ${gf.grade_id}`][gf.Grade.Course.name] = gf.fee || 1000;
+          totalCourseFees += gf.fee || 1000;
+        });
+      });
+    } else {
+      // Determine the next unpaid month
+      let currentMonth = format(new Date(), 'MMM');
+      if (payments.length > 0) {
+        const lastPaymentMonth = format(new Date(payments[0].payment_date), 'MMM');
+        const lastPaidIndex = monthsList.indexOf(lastPaymentMonth);
+        currentMonth = monthsList[(lastPaidIndex + 1) % 12];
+      }
+
+      courseFees[currentMonth] = {};
+      gradeFees.forEach(gf => {
+        if (!courseFees[currentMonth][`Grade ${gf.grade_id}`]) {
+          courseFees[currentMonth][`Grade ${gf.grade_id}`] = {};
+        }
+        courseFees[currentMonth][`Grade ${gf.grade_id}`][gf.Grade.Course.name] = gf.fee || 1000;
+        totalCourseFees += gf.fee || 1000;
+      });
     }
 
-    const relevantFee = gradeFees.length > 0 ? gradeFees[0].fee : 0;
     const hasPayments = payments.length > 0;
     const admissionFee = hasPayments ? 0 : 1000;
-    const totalFees = relevantFee + admissionFee;
+    const totalFees = totalCourseFees + admissionFee;
 
     res.json({
       student_details_id: Number(student_details_id),
-      course_fees: { [currentMonth]: { [`Grade ${gradeFees[0]?.grade_id || 'Unknown'}`]: { [gradeFees[0]?.Grade?.Course?.name || 'Unknown Course']: relevantFee } } },
-      total_course_fees: relevantFee,
+      course_fees: courseFees,
+      total_course_fees: totalCourseFees,
       admission_fee: admissionFee,
       total_fees: totalFees,
       last_paid_month: payments.length > 0 ? format(new Date(payments[0].payment_date), 'MMM') : null,
+      selectedMonths: queriedMonths.length > 0 ? queriedMonths : [], // Add selectedMonths
     });
   } catch (error) {
     console.error("Error calculating student fees:", error);
@@ -368,6 +435,7 @@ exports.calculateStudentFees = async (req, res) => {
 exports.getpayment = async (req, res) => {
   try {
     const { student_details_id } = req.params;
+    const { months } = req.query;
 
     if (!student_details_id || isNaN(student_details_id)) {
       return res.status(400).json({ error: "Valid student_details_id is required" });
@@ -427,55 +495,43 @@ exports.getpayment = async (req, res) => {
 
     let totalCourseFees = 0;
     const courseFees = {};
+    const monthsList = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     const currentDate = new Date();
-    const currentMonth = format(currentDate, 'MMM');
-    const currentYear = currentDate.getFullYear();
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     const currentMonthIndex = currentDate.getMonth();
+    const paidMonths = [...new Set(payments.filter(p => p.status === 'Paid').map(p => format(new Date(p.payment_date), 'MMM yyyy')))];
 
-    // Determine the last paid month index
-    let lastPaidIndex = -1;
-    const paidPayments = payments.filter(p => p.status === 'Paid');
-    const paidMonths = [...new Set(paidPayments.map(p => format(new Date(p.payment_date), 'MMM yyyy')))].sort((a, b) => new Date(a) - new Date(b));
-    if (paidMonths.length > 0) {
-      const lastPaidDate = new Date(paidMonths[paidMonths.length - 1]);
-      lastPaidIndex = months.indexOf(format(lastPaidDate, 'MMM'));
-    }
+    const queriedMonths = months ? months.split(',').filter(m => monthsList.includes(m)) : [];
 
-    // Set the due month (next after last paid, or current month if no payments)
-    const dueMonthIndex = lastPaidIndex >= 0 ? (lastPaidIndex + 1) % 12 : currentMonthIndex;
-    const dueMonth = months[dueMonthIndex];
-    const upcomingMonthIndex = (dueMonthIndex + 1) % 12;
-    const upcomingMonth = months[upcomingMonthIndex];
-
-    // Determine if admission fee should be applied (only for new students in their first payment month)
-    const isNewStudent = paidMonths.length === 0;
-    const isFirstPaymentMonth = isNewStudent && dueMonth === currentMonth;
-    const admissionFee = isFirstPaymentMonth ? 1000 : 0;
-
-    // Populate courseFees only for due and upcoming months
-    const monthsToInclude = [dueMonth, upcomingMonth];
-    monthsToInclude.forEach(month => {
-      courseFees[month] = {};
-      gradeFees.forEach(gf => {
-        if (!courseFees[month][`Grade ${gf.grade_id}`]) courseFees[month][`Grade ${gf.grade_id}`] = {};
-        courseFees[month][`Grade ${gf.grade_id}`][gf.Grade.Course.name] = gf.fee || 1000;
-        if (month === dueMonth && !paidMonths.some(p => p.startsWith(month))) {
+    if (queriedMonths.length > 0) {
+      queriedMonths.forEach(month => {
+        courseFees[month] = {};
+        gradeFees.forEach(gf => {
+          if (!courseFees[month][`Grade ${gf.grade_id}`]) {
+            courseFees[month][`Grade ${gf.grade_id}`] = {};
+          }
+          courseFees[month][`Grade ${gf.grade_id}`][gf.Grade.Course.name] = gf.fee || 1000;
           totalCourseFees += gf.fee || 1000;
-        }
+        });
       });
-    });
-
-    // Fallback if no gradeFees data
-    if (Object.keys(courseFees).length === 0 && gradeFees.length > 0) {
-      monthsToInclude.forEach(month => {
-        courseFees[month] = { [`Grade ${gradeFees[0].grade_id}`]: { [gradeFees[0].Grade.Course.name]: gradeFees[0].fee || 1000 } };
-        if (month === dueMonth && !paidMonths.some(p => p.startsWith(month))) {
-          totalCourseFees += gradeFees[0].fee || 1000;
-        }
+    } else {
+      const dueMonthIndex = paidMonths.length > 0 ? (monthsList.indexOf(paidMonths[paidMonths.length - 1].split(' ')[0]) + 1) % 12 : currentMonthIndex;
+      const dueMonth = monthsList[dueMonthIndex];
+      monthsList.forEach(m => {
+        courseFees[m] = {};
+        gradeFees.forEach(gf => {
+          if (!courseFees[m][`Grade ${gf.grade_id}`]) {
+            courseFees[m][`Grade ${gf.grade_id}`] = {};
+          }
+          courseFees[m][`Grade ${gf.grade_id}`][gf.Grade.Course.name] = gf.fee || 1000;
+          if (m === dueMonth && !paidMonths.some(p => p.startsWith(m))) {
+            totalCourseFees += gf.fee || 1000;
+          }
+        });
       });
     }
 
+    const isNewStudent = paidMonths.length === 0;
+    const admissionFee = isNewStudent ? 1000 : 0;
     const totalFees = totalCourseFees + admissionFee;
 
     const user = student.user || {};
@@ -487,13 +543,13 @@ exports.getpayment = async (req, res) => {
       student_details_id: Number(student_details_id),
       student_no: student.student_no || null,
       branch_name: branch ? branch.branch_name : null,
-      full_name: full_name,
+      full_name,
       course_fees: courseFees,
       total_course_fees: totalCourseFees,
       admission_fee: admissionFee,
       total_fees: totalFees,
       payments: paidMonths,
-      due_month: dueMonth,
+      due_month: queriedMonths.length > 0 ? null : monthsList[(monthsList.indexOf(paidMonths[paidMonths.length - 1]?.split(' ')[0] || 'Dec') + 1) % 12],
     });
   } catch (error) {
     console.error("Error calculating student fees:", error);
